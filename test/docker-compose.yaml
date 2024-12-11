@@ -1,0 +1,173 @@
+services:
+  # ==================================================
+  # MinIO service: S3 compatible object storage
+  # ==================================================
+  minio:
+    image: minio/minio:RELEASE.2024-09-13T20-26-02Z
+    container_name: minio
+    hostname: minio
+    environment:
+      MINIO_ROOT_USER: ${AWS_ACCESS_KEY_ID:-minio_access_key}
+      MINIO_ROOT_PASSWORD: ${AWS_SECRET_ACCESS_KEY:-minio_secret_key}
+      # MINIO_BROWSER_REDIRECT_URL: ${MINIO_BROWSER_REDIRECT_URL:-https://minio-console.example.com}
+    volumes:
+      - ./volumes/minio:/data
+    ports:
+      - ${MINIO_API_PORT:-9000}:9000
+      - ${MINIO_CONSOLE_PORT:-9001}:9001
+    command: server /data --console-address ":${MINIO_CONSOLE_PORT:-9001}"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${MINIO_API_PORT:-9000}/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - data-network
+
+  # Create bucket in MinIO: create delta bucket
+  createbucket:
+    hostname: createbucket
+    container_name: createbucket
+    image: minio/mc:RELEASE.2024-01-13T08-44-48Z
+    depends_on:
+      - minio
+    environment:
+      MINIO_ACCESS_KEY: ${AWS_ACCESS_KEY_ID:-minio_access_key}
+      MINIO_SECRET_KEY: ${AWS_SECRET_ACCESS_KEY:-minio_secret_key}
+      # custom env vars
+      MINIO_ENDPOINT: ${AWS_S3_ENDPOINT:-http://minio:9000}
+      DATALAKE_BUCKET: ${DATALAKE_BUCKET:-finlake}
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set myminio ${MINIO_ENDPOINT} ${MINIO_ACCESS_KEY} ${MINIO_SECRET_KEY};
+      /usr/bin/mc mb myminio/${DATALAKE_BUCKET};
+      "
+    networks:
+      - data-network
+
+  # ==================================================
+  # Nessie: Git-like experience for Apache Iceberg
+  # ==================================================
+  nessie:
+    image: projectnessie/nessie
+    container_name: nessie
+    hostname: nessie
+    depends_on:
+      - nessie-db
+    ports:
+      - "19120:19120"
+    environment:
+      - QUARKUS_HTTP_PORT=19120
+      - QUARKUS_PROFILE=prod
+      - QUARKUS_DATASOURCE_JDBC_URL=jdbc:postgresql://nessie-db:5432/nessie
+      - QUARKUS_DATASOURCE_USERNAME=nessie_user
+      - QUARKUS_DATASOURCE_PASSWORD=nessie_password
+      - NESSIE_VERSION_STORE_TYPE=JDBC
+    volumes:
+      - ./volumes/nessie/data:/var/lib/nessie/data
+    networks:
+      - data-network
+
+  nessie-db:
+    image: postgres:14.1-alpine
+    hostname: nessie-db
+    environment:
+      POSTGRES_DB: nessie
+      POSTGRES_USER: nessie_user
+      POSTGRES_PASSWORD: nessie_password
+    ports:
+      - 5435:5432
+    volumes:
+      - ./volumes/nessie/db_data:/var/lib/postgresql/data
+    networks:
+      - data-network
+  
+  # ==================================================
+  # Trino: distributed SQL query engine for big data
+  # Trino cluster service consists of Trino `coordinator` and `worker`
+  # ==================================================
+  # Trino coordinator service: client-facing service that accepts incoming queries
+  trino:
+    container_name: trino
+    image: "trinodb/trino:455"
+    hostname: trino
+    profiles:
+      - trino
+    # restart: on-failure
+    environment:
+      # custom env vars
+      TRINO_PORT_EXPOSE: ${TRINO_PORT_EXPOSE:-8090}
+      CATALOG_MANAGEMENT: dynamic
+    volumes:
+      - ./trino/etc/jvm.config:/etc/trino/jvm.config
+      - ./trino/etc/coordinator.config.properties:/etc/trino/config.properties
+      - ./trino/catalog:/etc/trino/catalog
+    ports:
+      - "${TRINO_PORT_EXPOSE}:8080"
+    depends_on:
+      - nessie
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/info"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - data-network
+
+  # ==================================================
+  # Spark cluster service consists of Spark master and worker
+  # use `docker-compose --profile spark up` to start the Spark cluster.
+  # ==================================================
+  spark-master:
+    hostname: spark-master
+    container_name: spark-master
+    image: bitnami/spark:3.4.1
+    command: bin/spark-class org.apache.spark.deploy.master.Master
+    profiles:
+      - spark
+    environment:
+      SPARK_MODE: master
+      # custom env vars
+      SPARK_MASTER_PORT_EXPOSE: ${SPARK_MASTER_PORT_EXPOSE:-7077}
+      SPARK_MASTER_WEBUI_PORT_EXPOSE: ${SPARK_MASTER_WEBUI_PORT_EXPOSE:-8081}
+    volumes:
+      - ./spark/spark-apps:/opt/spark-apps
+      - ./spark/spark-config/spark-defaults.conf:/opt/bitnami/spark/conf/spark-defaults.conf
+      # - ./spark/spark-config/hive-site.xml:/opt/bitnami/spark/conf/hive-site.xml
+      # - ./spark/spark-config/core-site.xml:/opt/bitnami/spark/conf/core-site.xml
+    ports:
+      - "${SPARK_MASTER_WEBUI_PORT_EXPOSE}:8080"
+      - "${SPARK_MASTER_PORT_EXPOSE}:7077"
+    depends_on:
+      - minio
+    networks:
+      - data-network
+
+  spark-worker:
+    hostname: spark-worker
+    image: bitnami/spark:3.4.1
+    command: bin/spark-class org.apache.spark.deploy.worker.Worker ${SPARK_MASTER_URL}
+    profiles:
+      - spark
+    depends_on:
+      - spark-master
+    environment:
+      SPARK_MODE: worker
+      SPARK_WORKER_CORES: ${SPARK_WORKER_CORES:-1}
+      SPARK_WORKER_MEMORY: ${SPARK_WORKER_MEMORY:-1g}
+      SPARK_MASTER_URL: ${SPARK_MASTER_URL:-spark://spark-master:7077}
+      # custom env vars
+      SPARK_WORKER_IP_RANGE: ${SPARK_WORKER_IP_RANGE:-'8091-8100'}
+    ports:
+      - ${SPARK_WORKER_IP_RANGE}:8081
+    networks:
+      - data-network
+
+# ==================================================
+# Networks configuration
+# data-network: external network for data platform services. This network must be created before running the docker-compose file.
+# use `docker network create --driver bridge data-network` to create the network.
+# ==================================================
+networks:
+  data-network:
+    external: true
